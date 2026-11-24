@@ -1,0 +1,448 @@
+---
+title: 'Optimizing Pediatric Outcomes: Advanced Bayesian Modeling of Days Without
+  Mechanical Ventilation in Respiratory Trials '
+author: "Mariateresa"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(janitor)
+library(tidyverse)
+library(readxl)
+library(brms)
+library(bayesplot)
+library(broom)
+library(sjPlot)
+library(bayestestR)
+library(pander)
+library(ggplot2)
+library(scales)
+library(marginaleffects)
+library(loo)
+panderOptions('table.split.table', Inf)
+
+set.seed(12345)
+data <- read_excel("repository_HFNC_x_NIV (1).xlsx", sheet = "Página1", na = c("nc", "pf", "md", "NA"))
+data$Plot_ID <- NULL
+data$TD <- parse_number(data$TD)
+data <- clean_names(data)
+
+# NIV = riferimento in tutti i modelli
+data$gr <- factor(data$gr, levels = c("NIV", "HFNC"))
+
+# Intubazione: variabile 'it' (y/n) -> 66 eventi
+data$intub <- ifelse(data$it == "y", 1, 0)
+data$out   <- factor(data$intub, levels = c(0, 1))
+
+# Durata: intubati con durata nota, non intubati senza durata
+data$dur_ok <- ifelse(data$intub == 1, !is.na(data$mv), is.na(data$mv))
+data$out2   <- ifelse(data$intub == 1, data$mv, 0)
+data$out3   <- data$out2 / max(data$out2, na.rm = TRUE)
+
+# Campione per i modelli sulla durata (247)
+dur <- subset(data, dur_ok)
+PROLONGED_CUTOFF <- 5   # DA CONFERMARE: soglia di 'prolungata'
+dur$out4 <- ordered(cut(dur$out2, breaks = c(-Inf, 0, PROLONGED_CUTOFF - 1, Inf),
+                        labels = c("none", "short", "prolonged")),
+                    levels = c("none", "short", "prolonged"))
+```
+
+```{r}
+library(ggplot2)
+
+# Create a fancy histogram (giorni di ventilazione, campione durata)
+ggplot(dur, aes(x = out2)) +
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 1,
+                 fill = "darkorange",
+                 color = "white",
+                 alpha = 0.8) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Distribution of out2",
+       x = "Days of Mechanical Ventilation",
+       y = "") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Randomization arm
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(compareGroups)
+
+res2 <- compareGroups(gr ~ . , data = data, method = 1,
+    )
+tt <- createTable(res2, show.ratio = TRUE, show.all = TRUE, show.n = TRUE, show.p.overall = TRUE)
+
+export2csv(tt, file = 'table1.csv')
+
+pander::pander(read.csv('table1.csv'))
+```
+
+# Models
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+pri_int <- prior(normal(0, 2.5), class = Intercept)
+pri_b   <- prior(normal(0, 2.5), class = b)
+
+# 1. Logistica: intubazione, tutti i 252
+mod0 <- brm(out ~ gr, data = data, family = bernoulli(),
+            prior = c(pri_int, pri_b), refresh = 0, seed = 12345)
+
+# 2. Lineare: giorni (campione durata)
+mod1 <- brm(out2 ~ gr, data = dur, family = gaussian(link = "identity"),
+            prior = c(pri_int, pri_b, prior(exponential(1), class = sigma)), seed = 12345)
+
+# 3. Hurdle negative binomial: giorni
+mod2 <- brm(brmsformula(out2 ~ gr, hu ~ gr), data = dur,
+            family = hurdle_negbinomial(link = "log", link_shape = "identity", link_hu = "logit"),
+            prior = c(pri_int, pri_b,
+                      prior(normal(0, 2.5), class = Intercept, dpar = hu),
+                      prior(normal(0, 2.5), class = b, dpar = hu),
+                      prior(exponential(1), class = shape)),
+            seed = 12345)
+
+# 4. ZOIB: proporzione del massimo osservato
+mod3 <- brm(brmsformula(out3 ~ gr, zoi ~ gr, coi ~ gr), data = dur,
+            family = zero_one_inflated_beta(link = "logit", link_phi = "identity",
+                                            link_zoi = "logit", link_coi = "logit"),
+            prior = c(pri_int, pri_b,
+                      prior(normal(0, 2.5), class = Intercept, dpar = zoi),
+                      prior(normal(0, 2.5), class = b, dpar = zoi),
+                      prior(normal(0, 2.5), class = Intercept, dpar = coi),
+                      prior(normal(0, 2.5), class = b, dpar = coi),
+                      prior(exponential(1), class = phi)),
+            seed = 12345)
+
+# 5. Cumulativa: tre categorie
+mod4 <- brm(out4 ~ gr, data = dur,
+            family = cumulative(link = "logit", threshold = "flexible"),
+            prior = c(prior(normal(0, 5), class = Intercept), pri_b),
+            seed = 12345)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Convergenza: Rhat < 1.01, ESS > 400, nessuna divergenza. Da riportare nel paper.
+sapply(list(mod0 = mod0, mod1 = mod1, mod2 = mod2, mod3 = mod3, mod4 = mod4),
+              function(m) max(brms::rhat(m), na.rm = TRUE))
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Helper comuni.
+# arm_draws: distribuzioni posteriori per braccio (NIV, HFNC) sulla scala del modello.
+#   Per la cumulativa restituisce P(non prolungata) = P(nessuna) + P(breve);
+#   nel blocco della cumulativa viene convertita in P(prolungata) = 1 - P(non prolungata),
+#   così che NIV - HFNC > 0 favorisca HFNC come negli altri modelli.
+arm_draws <- function(model) {
+  nd <- data.frame(gr = factor(c("NIV", "HFNC"), levels = c("NIV", "HFNC")))
+  ep <- posterior_epred(model, newdata = nd)
+  if (length(dim(ep)) == 3) ep <- ep[, , 1] + ep[, , 2]
+  list(niv = ep[, 1], hfnc = ep[, 2])
+}
+# fmt: mediana (IC 95%) come stringa
+fmt <- function(x) sprintf("%.2f (%.2f; %.2f)", median(x), quantile(x, .025), quantile(x, .975))
+# dpar_effect: differenza NIV - HFNC su un parametro del modello (hu, zoi, coi).
+#   avg_slopes restituisce HFNC - NIV (NIV = riferimento), quindi il segno viene invertito.
+dpar_effect <- function(model, dpar) {
+  sl <- posterior_draws(avg_slopes(model, dpar = dpar))
+  d  <- -sl$draw
+  c(median = median(d), lo = quantile(d, .025), hi = quantile(d, .975), p_niv_gt_hfnc = mean(d > 0))
+}
+```
+
+# Logistic
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a  <- arm_draws(mod0)
+d  <- a$niv - a$hfnc                 # NIV - HFNC, rischio di intubazione
+NIV  <- fmt(a$niv)
+HFNC <- fmt(a$hfnc)
+MD   <- fmt(d)
+pv_ninf <- mean(d > -0.15)           # non-inferiorità: HFNC non peggiore di NIV di oltre 15 punti
+pv      <- mean(d > 0)               # superiorità di HFNC (rischio più basso)
+
+dens <- density(d, from = -0.155, to = 1, n = 4096)
+dd   <- data.frame(x = dens$x, y = dens$y)
+ggplot(dd, aes(x, y)) +
+  geom_area(data = subset(dd, x > -0.15), fill = "royalblue", alpha = 0.4) +
+  geom_area(data = subset(dd, x <= -0.15), fill = "darkorange", alpha = 0.4) +
+  geom_line() +
+  geom_vline(xintercept = c(-0.15, 0), color = "red", linetype = "dashed", linewidth = 1) +
+  coord_cartesian(xlim = c(-0.4, 0.4), ylim = c(0, max(dd$y) * 1.05), expand = FALSE) +
+  labs(x = "Risk difference (NIV − HFNC)", y = "Density") +
+  theme_minimal() + theme(plot.margin = margin(2, 6, 2, 2))
+
+pander(data.frame(HFNC, NIV, MD, pv_ninf, pv))
+```
+
+# Linear
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a   <- arm_draws(mod1)
+r   <- a$niv / a$hfnc               # rapporto NIV / HFNC
+NIV  <- fmt(a$niv)                   # giorni
+HFNC <- fmt(a$hfnc)
+MD   <- fmt(a$niv - a$hfnc)          # differenza giorni NIV - HFNC
+pv_ninf <- mean(r > 0.85)            # non-inferiorità: rapporto > 0.85 (margine 15%)
+pv      <- mean(r > 1)               # superiorità di HFNC
+mae <- median(abs(predict(mod1)[, 1] - dur$out2))
+
+pander(data.frame(HFNC, NIV, MD, pv_ninf, pv, mae))
+```
+
+# Hurdle
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a   <- arm_draws(mod2)
+r   <- a$niv / a$hfnc
+NIV  <- fmt(a$niv)
+HFNC <- fmt(a$hfnc)
+MD   <- fmt(a$niv - a$hfnc)
+pv_ninf <- mean(r > 0.85)
+pv      <- mean(r > 1)
+hu_eff  <- dpar_effect(mod2, "hu")   # differenza NIV - HFNC nella probabilità di NON essere intubati (hu = P(y = 0))
+mae <- median(abs(predict(mod2)[, 1] - dur$out2))
+
+pander(data.frame(HFNC, NIV, MD, pv_ninf, pv, hu_eff["median"], hu_eff["lo"], hu_eff["hi"],
+                  hu_eff["p_niv_gt_hfnc"], mae))
+```
+
+# ZOI
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a   <- arm_draws(mod3)
+r   <- a$niv / a$hfnc               # rapporto della proporzione attesa NIV / HFNC
+NIV  <- fmt(a$niv)
+HFNC <- fmt(a$hfnc)
+MD   <- fmt(a$niv - a$hfnc)
+pv_ninf <- mean(r > 0.85)
+pv      <- mean(r > 1)
+coi_eff <- dpar_effect(mod3, "coi")
+zoi_eff <- dpar_effect(mod3, "zoi")
+mae <- mean(abs(predict(mod3)[, 1] * max(dur$out2) - dur$out2))
+
+pander(data.frame(HFNC, NIV, MD, pv_ninf, pv, mae,
+                  coi = coi_eff["median"], pv_coi = coi_eff["p_niv_gt_hfnc"],
+                  zoi = zoi_eff["median"], pv_zoi = zoi_eff["p_niv_gt_hfnc"]))
+```
+
+# Cumulative
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a      <- arm_draws(mod4)            # P(non prolungata) per braccio
+p_niv  <- 1 - a$niv                  # P(prolungata) NIV
+p_hfnc <- 1 - a$hfnc                 # P(prolungata) HFNC
+d      <- p_niv - p_hfnc             # NIV - HFNC; positivo = HFNC favorito, come negli altri modelli
+NIV  <- fmt(p_niv)
+HFNC <- fmt(p_hfnc)
+MD   <- fmt(d)
+pv_ninf <- mean(d > -0.15)           # non-inferiorità: HFNC non peggiore di NIV di oltre 15 punti
+pv      <- mean(d > 0)               # superiorità di HFNC (meno ventilazione prolungata)
+
+dens <- density(d, from = -0.3, to = 0.4, n = 4096)
+dd   <- data.frame(x = dens$x, y = dens$y)
+ggplot(dd, aes(x, y)) +
+  geom_area(data = subset(dd, x > -0.15), fill = "royalblue", alpha = 0.4) +
+  geom_area(data = subset(dd, x <= -0.15), fill = "darkorange", alpha = 0.4) +
+  geom_line() +
+  geom_vline(xintercept = c(-0.15, 0), color = "red", linetype = "dashed", linewidth = 1) +
+  coord_cartesian(xlim = c(-0.3, 0.4), ylim = c(0, max(dd$y) * 1.05), expand = FALSE) +
+  labs(x = "Difference in P(prolonged ventilation) (NIV − HFNC)", y = "Density") +
+  theme_minimal() + theme(plot.margin = margin(2, 6, 2, 2))
+
+pander(data.frame(HFNC, NIV, MD, pv_ninf, pv))
+```
+
+```{r}
+# Confronto predittivo: LOO solo tra modelli con stessa risposta (giorni) e stesso campione.
+# mod4 (categorie ordinali), mod3 (proporzione) e mod0 (binario, 252 pazienti) non sono confrontabili:
+# WAIC riportati solo come descrittivi.
+loo_compare(loo(mod1), loo(mod2))
+
+cat("\nWAIC (descrittivo):\n")
+print(waic(mod0)); print(waic(mod3))
+```
+
+# Supplementary: prior sensitivity analysis
+
+- **Weakly informative (main analysis), Normal(0, 2.5)**: methodological convention, no clinical data [@gelman2008weakly].
+- **Vague, Normal(0, 10)**: no reference; extreme "non-informative" prior used for comparison.
+- **Sceptical, Normal(0, 0.35)**: centred on no effect, 95% prior mass on odds ratios between 0.5 and 2 [@spiegelhalter1994bayesian]; applied in critical care by Goligher et al. [@goligher2018extracorporeal].
+- **Evidence-based, Normal(−0.17, 0.24)**: intubation, CPAP versus HFNC, odds ratio 1.18 (95% CI 0.74–1.89) from 5 randomized trials and 541 infants [@buendia2022systematic]; consistent with a risk ratio of intubation of 0.87 (0.60–1.28) for HFNC versus non-invasive positive pressure ventilation [@zhong2022comparison].
+- **Pessimistic, Normal(0.42, 0.24)**: treatment failure with HFNC, risk ratio 1.52 (1.21–1.92) [@zhong2022comparison]; supported by the TRAMONTANE trial, in which HFNC was not non-inferior to nasal CPAP [@milesi2017high].
+
+```{r prior-sens-setup, echo=FALSE, message=FALSE, warning=FALSE}
+# Requires objects defined above: data, dur, mod0-mod4, pri_int, arm_draws.
+# Only the prior on the TREATMENT coefficient (grHFNC) is changed; intercepts and
+# auxiliary parameters (sigma, shape, phi) keep the priors of the main analysis.
+#
+# Sign convention of the brms coefficients (NIV = reference):
+#   mod0 logistic (b)      : > 0 -> HFNC more intubations          (harm)
+#   mod1 linear  (b)       : > 0 -> HFNC more days                 (harm)
+#   mod2 hurdle  (b, mu)   : > 0 -> HFNC longer conditional course  (harm)
+#   mod2 hurdle  (b, hu)   : > 0 -> HFNC more zeros (no IMV)        (BENEFIT, sign flipped)
+#   mod3 ZOIB    (b, mu/zoi/coi): duration-related, no external evidence
+#   mod4 cumulative (b)    : > 0 -> HFNC higher categories          (harm)
+#
+# PRIOR SCENARIOS (treatment effect on intubation, log-odds scale, HFNC vs NIV)
+# 1. Weakly informative (main analysis): Normal(0, 2.5).
+# 2. Vague: Normal(0, 10), on all treatment coefficients.
+# 3. Sceptical: centred on no effect, 95% prior mass on OR between 0.5 and 2
+#    (Spiegelhalter et al., JRSS A 1994; Goligher et al., JAMA 2018).
+# 4. Evidence-based: meta-analysis of 5 RCTs (541 infants with bronchiolitis), CPAP vs HFNC
+#    (Buendia et al., BMC Pediatr 2022): intubation OR CPAP vs HFNC 1.18 (95% CI 0.74-1.89),
+#    i.e. HFNC vs CPAP OR 0.85 (0.53-1.35). Consistent with Zhong et al., Front Pediatr 2022
+#    (HFNC vs NIPPV, intubation RR 0.87, 0.60-1.28).
+#    mean = log(1/1.18) = -0.17; sd = (log(1.89) - log(0.74)) / (2 * 1.96) = 0.24
+# 5. Pessimistic: treatment failure was more frequent with HFNC (Zhong et al. 2022: RR 1.52,
+#    1.21-1.92; TRAMONTANE, Milesi et al., Intensive Care Med 2017). Centred on log(1.52) = 0.42,
+#    with the sd of the evidence-based prior because failure is only an indirect proxy of intubation.
+#
+# No pooled external estimate of IMV DURATION is available: in scenarios 4-5 the duration-related
+# coefficients keep the weakly informative prior of the main analysis, and only the models with an
+# intubation component (mod0, mod2, mod4) are refitted. The linear model (days scale) is refitted
+# only under the vague prior, because no external information is available to scale it in days.
+
+EB_MEAN  <- log(1 / 1.18)
+EB_SD    <- (log(1.89) - log(0.74)) / (2 * qnorm(0.975))
+PES_MEAN <- log(1.52)
+SCEP_SD  <- log(2) / qnorm(0.975)
+W_SD     <- 2.5                                  # weakly informative sd of the main analysis
+
+scenarios <- data.frame(
+  scenario = c("Weakly informative (main)", "Vague", "Sceptical",
+               "Evidence-based (meta-analysis)", "Pessimistic (treatment failure)"),
+  target   = c("main", "all", "all", "intubation", "intubation"),
+  mean     = c(0, 0, 0, EB_MEAN, PES_MEAN),
+  sd       = c(W_SD, 10, SCEP_SD, EB_SD, EB_SD),
+  stringsAsFactors = FALSE)
+
+models_in <- function(sc) {
+  if (sc$scenario == "Vague") return(c("mod0", "mod1", "mod2", "mod3", "mod4"))
+  switch(sc$target,
+         main       = c("mod0", "mod1", "mod2", "mod3", "mod4"),
+         all        = c("mod0", "mod2", "mod3", "mod4"),
+         intubation = c("mod0", "mod2", "mod4"))
+}
+
+# Normal prior on the treatment coefficient of a given distributional parameter
+np <- function(m, s, dpar = "") {
+  set_prior(sprintf("normal(%.3f, %.3f)", m, s), class = "b", coef = "grHFNC", dpar = dpar)
+}
+
+make_priors <- function(model, sc) {
+  if (sc$target == "intubation") {
+    m_int <- sc$mean; s_int <- sc$sd; s_dur <- W_SD   # informative on intubation only
+  } else {
+    m_int <- 0;       s_int <- sc$sd; s_dur <- sc$sd  # same prior on all coefficients
+  }
+  switch(model,
+    mod0 = c(pri_int, np(m_int, s_int)),
+    mod1 = c(pri_int, np(0, sc$sd), prior(exponential(1), class = sigma)),
+    mod2 = c(pri_int, np(0, s_dur),
+             prior(normal(0, 2.5), class = Intercept, dpar = hu),
+             np(-m_int, s_int, "hu"),                 # hu = P(no IMV): sign flipped
+             prior(exponential(1), class = shape)),
+    mod3 = c(pri_int, np(0, s_dur),
+             prior(normal(0, 2.5), class = Intercept, dpar = zoi),
+             prior(normal(0, 2.5), class = Intercept, dpar = coi),
+             np(0, s_dur, "zoi"), np(0, s_dur, "coi"),
+             prior(exponential(1), class = phi)),
+    mod4 = c(prior(normal(0, 5), class = Intercept), np(m_int, s_int)))
+}
+
+main_models <- list(mod0 = mod0, mod1 = mod1, mod2 = mod2, mod3 = mod3, mod4 = mod4)
+types <- c(mod0 = "risk", mod1 = "days", mod2 = "days", mod3 = "days", mod4 = "cum")
+model_labels <- c(mod0 = "Logistic: intubation risk",
+                  mod1 = "Linear: IMV days",
+                  mod2 = "Hurdle: IMV days (marginal)",
+                  mod3 = "ZOIB: proportion of max duration",
+                  mod4 = "Cumulative: P(prolonged IMV)")
+
+# Numeric summary of NIV - HFNC (positive = HFNC favoured), same decision rules as the main analysis
+num_summary <- function(model, type) {
+  a <- arm_draws(model)
+  if (type == "cum") { niv <- 1 - a$niv; hfnc <- 1 - a$hfnc } else { niv <- a$niv; hfnc <- a$hfnc }
+  d <- niv - hfnc
+  r <- niv / hfnc
+  binary <- type %in% c("risk", "cum")
+  data.frame(median = median(d),
+             lo     = unname(quantile(d, .025)),
+             hi     = unname(quantile(d, .975)),
+             p_sup  = if (binary) mean(d > 0) else mean(r > 1),
+             p_ni   = if (binary) mean(d > -0.15) else mean(r > 0.85),
+             max_rhat = max(brms::rhat(model), na.rm = TRUE))
+}
+
+# Table of the priors actually used (for Additional file 1)
+pander(data.frame(
+  Scenario = scenarios$scenario,
+  `Prior on intubation effect (log-OR)` = sprintf("Normal(%.2f, %.2f)", scenarios$mean, scenarios$sd),
+  `Implied OR (95% prior interval)` = sprintf("%.2f (%.2f; %.2f)", exp(scenarios$mean),
+                                              exp(scenarios$mean - 1.96 * scenarios$sd),
+                                              exp(scenarios$mean + 1.96 * scenarios$sd)),
+  check.names = FALSE))
+```
+
+```{r prior-sens-fit, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+prior_sens <- do.call(rbind, lapply(seq_len(nrow(scenarios)), function(i) {
+  sc <- scenarios[i, ]
+  do.call(rbind, lapply(models_in(sc), function(m) {
+    fit <- if (sc$target == "main") main_models[[m]] else
+      update(main_models[[m]], prior = make_priors(m, sc), refresh = 0, seed = 12345)
+    cbind(scenario = sc$scenario, model = m, num_summary(fit, types[[m]]))
+  }))
+}))
+prior_sens$scenario  <- factor(prior_sens$scenario, levels = rev(scenarios$scenario))
+prior_sens$model_lab <- factor(model_labels[prior_sens$model], levels = model_labels)
+write.csv(prior_sens, "prior_sensitivity_results.csv", row.names = FALSE)
+```
+
+```{r prior-sens-table, echo=FALSE}
+ps <- prior_sens[order(prior_sens$model, -as.integer(prior_sens$scenario)), ]
+tab <- data.frame(
+  Model = as.character(ps$model_lab),
+  `Prior on treatment effect` = as.character(ps$scenario),
+  `NIV − HFNC (95% CrI)` = sprintf("%.2f (%.2f; %.2f)", ps$median, ps$lo, ps$hi),
+  `P(superiority)` = sprintf("%.1f%%", 100 * ps$p_sup),
+  `P(non-inferiority)` = sprintf("%.1f%%", 100 * ps$p_ni),
+  `Max Rhat` = sprintf("%.3f", ps$max_rhat),
+  check.names = FALSE, row.names = NULL)
+pander(tab)
+```
+
+```{r prior-sens-plot, echo=FALSE, fig.width=9, fig.height=7}
+ggplot(prior_sens, aes(x = median, y = scenario)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(xmin = lo, xmax = hi), width = 0.2, orientation = "y", colour = "darkorange") +
+  geom_point(size = 2, colour = "darkorange") +
+  facet_wrap(~ model_lab, scales = "free_x", ncol = 2) +
+  labs(x = "Supplementary Figure 1. Posterior difference NIV − HFNC (median, 95% CrI); positive values favour HFNC",
+       y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"), panel.grid.minor = element_blank())
+```
+
+```{r prior-sens-implied, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# What each prior implies BEFORE seeing the data, on the clinical scale
+# (logistic model: risk difference in intubation, NIV - HFNC).
+prior_implied <- do.call(rbind, lapply(seq_len(nrow(scenarios)), function(i) {
+  sc <- scenarios[i, ]
+  fit <- update(mod0, prior = make_priors("mod0", sc),
+                sample_prior = "only", refresh = 0, seed = 12345)
+  a <- arm_draws(fit)
+  d <- a$niv - a$hfnc
+  data.frame(scenario = sc$scenario,
+             `Prior RD (95% interval)` = sprintf("%.2f (%.2f; %.2f)",
+                                                 median(d), quantile(d, .025), quantile(d, .975)),
+             `Prior P(superiority)` = sprintf("%.1f%%", 100 * mean(d > 0)),
+             `Prior P(|RD| > 0.5)` = sprintf("%.1f%%", 100 * mean(abs(d) > 0.5)),
+             check.names = FALSE)
+}))
+pander(prior_implied)
+```
